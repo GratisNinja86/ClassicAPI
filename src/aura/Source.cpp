@@ -1406,6 +1406,43 @@ int32_t ConsumeTriggeredApplication(uint64_t victim, const uint8_t *rec,
 // keeps the parse short and robust.
 constexpr int kMaxTargets = 16;
 
+// ---- Linked auras ---------------------------------------------------------
+// Auras the server applies as a side effect of a player's cast, with no
+// SMSG_SPELL_GO of their own (Pounce -> Pounce Bleed). The cast names the
+// caster; treat the linked aura as cast by the same caster on the same hit
+// targets, exactly like a directly cast aura.
+struct LinkedAura {
+    uint32_t castId;
+    uint32_t auraId;
+};
+constexpr LinkedAura kLinkedAuras[] = {
+    {9005, 9007}, // Pounce R1 -> Pounce Bleed
+    {9823, 9824}, // Pounce R2 -> Pounce Bleed
+    {9827, 9826}, // Pounce R3 -> Pounce Bleed
+};
+
+void ApplyLinkedAuras(uint64_t caster, uint32_t spellId,
+                      const uint64_t *targets, int numTargets) {
+    if (numTargets <= 0 || caster != Unit::Identity::PlayerGuid())
+        return;
+    for (const auto &l : kLinkedAuras) {
+        if (l.castId != spellId)
+            continue;
+        const uint8_t *auraRec =
+        Spell::Lookup::RecordForID(static_cast<int>(l.auraId));
+        if (auraRec == nullptr)
+            return;
+        const uint32_t durationMs = SpellDurationMs(auraRec, /*player*/ true);
+        const uint32_t expirationMs = durationMs > 0 ? NowMs() + durationMs : 0;
+        // Safety net: lets StampApplication recover caster + talented
+        // duration if the application hook ends up owning the entry.
+        RememberPlayerCast(l.auraId);
+        for (int i = 0; i < numTargets; ++i)
+            StoreFromCast(targets[i], l.auraId, caster, expirationMs, durationMs);
+        return;
+    }
+}
+
 // The self-contained SPELL_GO processing (succeeded events, server-side
 // duration edits, aura-source caching). None of it reads engine descriptor
 // state, so it's order-independent of the engine's own SPELL_GO handler —
@@ -1454,6 +1491,8 @@ void HandleSpellGo(uint64_t caster, uint32_t spellId, const uint64_t *targets,
     if (g_trigAppCount != 0 && caster == Unit::Identity::PlayerGuid())
         for (int i = 0; i < numTargets; ++i)
             ArmTriggeredApplications(targets[i], spellId, rec);
+
+    ApplyLinkedAuras(caster, spellId, targets, numTargets);
 
     if (!SpellAppliesAura(rec))
         return;
